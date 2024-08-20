@@ -1,0 +1,530 @@
+File: ./src/UserWallet.sol
+----------------------------------------
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import {IAccount} from "../lib/account-abstraction/contracts/interfaces/IAccount.sol";
+import {PackedUserOperation} from "../lib/account-abstraction/contracts/interfaces/PackedUserOperation.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
+import {SIG_VALIDATION_FAILED, SIG_VALIDATION_SUCCESS} from "../lib/account-abstraction/contracts/core/Helpers.sol";
+import {IEntryPoint} from "../lib/account-abstraction/contracts/interfaces/IEntryPoint.sol";
+import {console} from "forge-std/console.sol";
+
+contract UserWallet is IAccount, Ownable {
+    error UserWallet__PrefundFailed();
+    error UserWallet__NotFromEntryPoint();
+    error UserWallet__NotFromEntryPointOrOwner();
+    error UserWallet__ExecuteFailed(bytes);
+    error UserWallet__WidthdrawalFailed();
+
+    event Received(address sender, uint256 amount);
+    event Executed(address target, uint256 value, bytes data);
+
+    IEntryPoint private immutable i_entryPoint;
+
+    modifier RequireFromEntryPoint() {
+        console.log("RequireFromEntryPoint: Checking if sender is EntryPoint");
+        if (msg.sender != address(i_entryPoint)) {
+            console.log("RequireFromEntryPoint: Sender is not EntryPoint");
+            revert UserWallet__NotFromEntryPoint();
+        }
+        _;
+    }
+
+    modifier RequireFromEntryPointOrOwner() {
+        console.log("RequireFromEntryPointOrOwner: Checking sender");
+        if (msg.sender != address(i_entryPoint) && msg.sender != owner()) {
+            console.log("RequireFromEntryPointOrOwner: Sender is neither EntryPoint nor owner");
+            revert UserWallet__NotFromEntryPointOrOwner();
+        }
+        _;
+    }
+
+    constructor(address _ownerAddress, address _entryPointAddress) Ownable(_ownerAddress) {
+        console.log("Constructor: Deploying UserWallet with owner:", _ownerAddress);
+        i_entryPoint = IEntryPoint(_entryPointAddress);
+        console.log("Constructor: EntryPoint set to:", _entryPointAddress);
+    }
+
+    function validateUserOp(PackedUserOperation calldata userOp, bytes32 userOpHash, uint256 missingAccountFunds)
+        external
+        RequireFromEntryPoint
+        returns (uint256 validationData)
+    {
+        console.log("validateUserOp: Validating user operation");
+        validationData = _validateSignature(userOp, userOpHash);
+        console.log("validateUserOp: Signature validation result:", validationData);
+        _payPrefund(missingAccountFunds);
+        console.log("validateUserOp: Prefund paid");
+        return validationData;
+    }
+
+    function _payPrefund(uint256 _missingAccountFunds) internal {
+        console.log("_payPrefund: Missing account funds:", _missingAccountFunds);
+        if (_missingAccountFunds != 0) {
+            console.log("_payPrefund: Attempting to pay prefund");
+            (bool success,) = payable(msg.sender).call{value: _missingAccountFunds, gas: type(uint96).max}("");
+            if (!success) {
+                console.log("_payPrefund: Prefund payment failed");
+                revert UserWallet__PrefundFailed();
+            }
+            console.log("_payPrefund: Prefund payment successful");
+        }
+    }
+
+    function _validateSignature(PackedUserOperation calldata userOp, bytes32 userOpHash)
+        internal
+        view
+        returns (uint256 validationData)
+    {
+        console.log("_validateSignature: Validating signature");
+        bytes32 messageHash = MessageHashUtils.toEthSignedMessageHash(userOpHash);
+        address recoveredAddress = ECDSA.recover(messageHash, userOp.signature);
+        console.log("_validateSignature: Recovered address:", recoveredAddress);
+
+        if (recoveredAddress == owner()) {
+            console.log("_validateSignature: Signature valid");
+            return SIG_VALIDATION_SUCCESS;
+        } else {
+            console.log("_validateSignature: Signature invalid");
+            return SIG_VALIDATION_FAILED;
+        }
+    }
+
+    function execute(address destination, uint256 value, bytes calldata functionData)
+        external
+        RequireFromEntryPointOrOwner
+    {
+        console.log("execute: Executing transaction to:", destination);
+        console.log("execute: Transaction value:", value);
+        (bool success, bytes memory result) = destination.call{value: value}(functionData);
+        if (!success) {
+            console.log("execute: Transaction failed");
+            revert UserWallet__ExecuteFailed(result);
+        }
+        console.log("execute: Transaction successful");
+        emit Executed(destination, value, functionData);
+    }
+
+    receive() external payable {
+        console.log("receive: Received Ether from:", msg.sender);
+        console.log("receive: Amount received:", msg.value);
+        emit Received(msg.sender, msg.value);
+    }
+
+    function getBalance() external view returns (uint256) {
+        uint256 balance = address(this).balance;
+        console.log("getBalance: Current balance:", balance);
+        return balance;
+    }
+
+    function withdraw() external onlyOwner {
+        uint256 amount = address(this).balance;
+        console.log("withdraw: Attempting to withdraw:", amount);
+        (bool success,) = payable(msg.sender).call{value: amount}("");
+        if (!success) {
+            revert UserWallet__WidthdrawalFailed();
+        }
+        console.log("withdraw: Withdrawal successful");
+    }
+    // In UserWallet.sol
+
+    function isUserWallet() public pure returns (bool) {
+        return true;
+    }
+
+    function getEntryPoint() external view returns (address) {
+        console.log("getEntryPoint: Returning EntryPoint address");
+        return address(i_entryPoint);
+    }
+}
+
+
+========================================
+
+
+File: ./src/JitCoin.sol
+----------------------------------------
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import {OFT} from "@layerzerolabs/lz-evm-oapp-v2/contracts/oft/OFT.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {
+    IOFT,
+    SendParam,
+    MessagingFee,
+    MessagingReceipt,
+    OFTReceipt
+} from "@layerzerolabs/lz-evm-oapp-v2/contracts/oft/interfaces/IOFT.sol";
+import {OFTMsgCodec} from "@layerzerolabs/lz-evm-oapp-v2/contracts/oft/libs/OFTMsgCodec.sol";
+import {OFTComposeMsgCodec} from "@layerzerolabs/lz-evm-oapp-v2/contracts/oft/libs/OFTComposeMsgCodec.sol";
+import {Origin} from "@layerzerolabs/lz-evm-oapp-v2/contracts/oapp/OApp.sol";
+import {IOAppMsgInspector} from "@layerzerolabs/lz-evm-oapp-v2/contracts/oapp/interfaces/IOAppMsgInspector.sol";
+import {
+    MessagingParams,
+    MessagingFee,
+    MessagingReceipt
+} from "@layerzerolabs/lz-evm-protocol-v2/contracts/interfaces/ILayerZeroEndpointV2.sol";
+import {IWalletFactory} from "./interfaces/IWalletFactory.sol";
+contract JITCoin is OFT {
+    using OFTMsgCodec for bytes;
+    using OFTMsgCodec for bytes32;
+
+    uint256 public totalETHDeposited;
+    IWalletFactory immutable walletFactory;
+
+    // Custom Errors
+    error JIT__InsufficientJITCoinBalance();
+    error JIT__InsufficientETHBalance();
+    error JIT__MustSendETH();
+    error JIT__ETHAndTokenMismatch();
+    error JIT__AmountBelowMinimum();
+    error JIT__NotValidUserWallet();
+
+    modifier ensureBalanceEquality() {
+        _;
+        if (address(this).balance != totalSupply()) revert JIT__ETHAndTokenMismatch();
+    }
+    modifier onlyValidUserWallet() {
+    if (!walletFactory.isValidUserWallet(msg.sender)) {
+        revert JIT__NotValidUserWallet();
+    }
+    _;
+}
+    constructor(string memory _name, string memory _symbol, address _layerZeroEndpoint, address _delegate,address _walletFactoryAddress)
+        OFT(_name, _symbol, _layerZeroEndpoint, _delegate)
+        Ownable(_delegate)
+    {
+        walletFactory = IWalletFactory(_walletFactoryAddress);
+    }
+
+    receive() external payable ensureBalanceEquality {
+        if (msg.value == 0) revert JIT__MustSendETH();
+        _mint(msg.sender, msg.value);
+        totalETHDeposited += msg.value;
+    }
+
+    function withdraw(uint256 amount) external ensureBalanceEquality {
+        if (balanceOf(msg.sender) < amount) revert JIT__InsufficientJITCoinBalance();
+        if (address(this).balance < amount) revert JIT__InsufficientETHBalance();
+        _burn(msg.sender, amount);
+        totalETHDeposited -= amount;
+        payable(msg.sender).transfer(amount);
+    }
+
+    function send(SendParam calldata _sendParam, MessagingFee calldata _messagingFee, address _refundAddress)
+        public
+        payable
+        virtual
+        override
+        ensureBalanceEquality
+        returns (MessagingReceipt memory receipt, OFTReceipt memory oftReceipt)
+    {
+        if (balanceOf(msg.sender) < _sendParam.amountLD) revert JIT__InsufficientJITCoinBalance();
+        if (address(this).balance < _sendParam.amountLD) revert JIT__InsufficientETHBalance();
+
+        (uint256 amountSentLD, uint256 amountReceivedLD) =
+            _debit(_sendParam.amountLD, _sendParam.minAmountLD, _sendParam.dstEid);
+
+        (bytes memory message, bytes memory options) = _buildMsgAndOptions(_sendParam, amountReceivedLD);
+
+        receipt = _lzSend(_sendParam.dstEid, message, options, _messagingFee, _refundAddress);
+        oftReceipt = OFTReceipt(amountSentLD, amountReceivedLD);
+
+        totalETHDeposited -= amountSentLD;
+
+        emit OFTSent(receipt.guid, _sendParam.dstEid, msg.sender, amountSentLD, amountReceivedLD);
+
+        return (receipt, oftReceipt);
+    }
+    /**
+     * @dev Internal function to interact with the LayerZero EndpointV2.send() for sending a message.
+     * @param _dstEid The destination endpoint ID.
+     * @param _message The message payload.
+     * @param _options Additional options for the message.
+     * @param _fee The calculated LayerZero fee for the message.
+     *      - nativeFee: The native fee.
+     *      - lzTokenFee: The lzToken fee.
+     * @param _refundAddress The address to receive any excess fee values sent to the endpoint.
+     * @return receipt The receipt for the sent message.
+     *      - guid: The unique identifier for the sent message.
+     *      - nonce: The nonce of the sent message.
+     *      - fee: The LayerZero fee incurred for the message.
+     */
+
+    function _lzSend(
+        uint32 _dstEid,
+        bytes memory _message,
+        bytes memory _options,
+        MessagingFee memory _fee,
+        address _refundAddress
+    ) internal override returns (MessagingReceipt memory receipt) {
+        // @dev Push corresponding fees to the endpoint, any excess is sent back to the _refundAddress from the endpoint.
+        uint256 messageValue = _payNative(_fee.nativeFee);
+        if (_fee.lzTokenFee > 0) _payLzToken(_fee.lzTokenFee);
+
+        return endpoint
+            // solhint-disable-next-line check-send-result
+            .send{value: messageValue}(
+            MessagingParams(_dstEid, _getPeerOrRevert(_dstEid), _message, _options, _fee.lzTokenFee > 0), _refundAddress
+        );
+    }
+
+    function _debit(uint256 _amountLD, uint256 _minAmountLD, uint32 /*_dstEid*/ )
+        internal
+        virtual
+        override
+        ensureBalanceEquality
+        returns (uint256 amountSentLD, uint256 amountReceivedLD)
+    {
+        amountSentLD = _removeDust(_amountLD);
+        amountReceivedLD = amountSentLD;
+
+        if (amountReceivedLD < _minAmountLD) revert JIT__AmountBelowMinimum();
+
+        _burn(msg.sender, amountSentLD);
+        totalETHDeposited -= amountSentLD;
+
+        return (amountSentLD, amountReceivedLD);
+    }
+
+    function _credit(address _to, uint256 _amountLD, uint32 /*_srcEid*/ )
+        internal
+        virtual
+        override
+        ensureBalanceEquality
+        returns (uint256 amountReceivedLD)
+    {
+        amountReceivedLD = _amountLD;
+        _mint(_to, amountReceivedLD);
+        totalETHDeposited += amountReceivedLD;
+        return amountReceivedLD;
+    }
+
+    function _lzReceive(
+        Origin calldata _origin,
+        bytes32 _guid,
+        bytes calldata _message,
+        address, /*_executor*/
+        bytes calldata /*_extraData*/
+    ) internal virtual override {
+        address toAddress = _message.sendTo().bytes32ToAddress();
+        uint256 amountReceivedLD = _credit(toAddress, _toLD(_message.amountSD()), _origin.srcEid);
+
+        if (_message.isComposed()) {
+            bytes memory composeMsg =
+                OFTComposeMsgCodec.encode(_origin.nonce, _origin.srcEid, amountReceivedLD, _message.composeMsg());
+            endpoint.sendCompose(toAddress, _guid, 0, composeMsg);
+        }
+
+        emit OFTReceived(_guid, _origin.srcEid, toAddress, amountReceivedLD);
+    }
+
+    function _buildMsgAndOptions(SendParam calldata _sendParam, uint256 _amountLD)
+        internal
+        view
+        override
+        returns (bytes memory message, bytes memory options)
+    {
+        bool hasCompose;
+        // @dev This generated message has the msg.sender encoded into the payload so the remote knows who the caller is.
+        (message, hasCompose) = OFTMsgCodec.encode(
+            _sendParam.to,
+            _toSD(_amountLD),
+            // @dev Must be include a non empty bytes if you want to compose, EVEN if you dont need it on the remote.
+            // EVEN if you dont require an arbitrary payload to be sent... eg. '0x01'
+            _sendParam.composeMsg
+        );
+        // @dev Change the msg type depending if its composed or not.
+        uint16 msgType = hasCompose ? SEND_AND_CALL : SEND;
+        // @dev Combine the callers _extraOptions with the enforced options via the OAppOptionsType3.
+        options = combineOptions(_sendParam.dstEid, msgType, _sendParam.extraOptions);
+
+        // @dev Optionally inspect the message and options depending if the OApp owner has set a msg inspector.
+        // @dev If it fails inspection, needs to revert in the implementation. ie. does not rely on return boolean
+        if (msgInspector != address(0)) IOAppMsgInspector(msgInspector).inspect(message, options);
+    }
+
+    function getContractETHBalance() external view returns (uint256) {
+        return address(this).balance;
+    }
+}
+
+
+========================================
+
+
+File: ./src/WalletFactory.sol
+----------------------------------------
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import {Create2} from "@openzeppelin/contracts/utils/Create2.sol";
+import {UserWallet} from "./UserWallet.sol";
+import {console} from "forge-std/console.sol";
+import {IUserWallet} from "./interfaces/IUserWallet.sol";
+
+contract WalletFactory {
+    error WalletFactory__WalletAlreadyExists();
+
+    mapping(address user => address wallet) public userWallets;
+    mapping(address wallet => address user) public walletToUser;
+    address immutable i_entryPointAddress;
+    uint256 public totalWallets;
+
+    event WalletCreated(address indexed user, address wallet);
+
+    constructor(address _entryPointAddress) {
+        i_entryPointAddress = _entryPointAddress;
+    }
+
+    function createWallet() external returns (address) {
+        if (userWallets[msg.sender] != address(0)) {
+            console.log("Wallet already exists for:", msg.sender);
+            revert WalletFactory__WalletAlreadyExists();
+        }
+
+        bytes32 salt = keccak256(abi.encodePacked(msg.sender));
+
+        // Correctly encode constructor arguments with the bytecode
+        bytes memory bytecode =
+            abi.encodePacked(type(UserWallet).creationCode, abi.encode(msg.sender, i_entryPointAddress));
+
+        address wallet = Create2.deploy(0, salt, bytecode);
+        console.log("Wallet created at address:", wallet);
+        totalWallets++;
+        userWallets[msg.sender] = wallet;
+        walletToUser[wallet] = msg.sender; // Add this line
+        emit WalletCreated(msg.sender, wallet);
+
+        return wallet;
+    }
+
+    // Getter functions
+
+    /// @notice Gets the wallet address for a given user
+    /// @param user The user address to look up
+    /// @return The wallet address associated with the user
+    function getUserWallet(address user) external view returns (address) {
+        console.log("Getting wallet for user:", user);
+        return userWallets[user];
+    }
+
+    /// @notice Gets the EntryPoint address
+    /// @return The EntryPoint address
+    function getEntryPointAddress() public view returns (address) {
+        return i_entryPointAddress;
+    }
+
+    /// @notice Checks if an address is a user wallet and is available in the walletFactory
+    /// @param _address The address to check
+    /// @return True if the address is a user wallet and available, false otherwise
+    function isValidUserWallet(address _address) public view returns (bool) {
+        // Use the Address library to check if the address is a contract
+
+        // Check if the address is available as a user wallet in the WalletFactory
+        if (walletToUser[_address] != address(0)) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    /// @notice Gets the user address for a given wallet address
+    /// @param _walletAddress The wallet address to look up
+    /// @return The user address associated with the wallet, or address(0) if not found
+    function getUserFromWallet(address _walletAddress) public view returns (address) {
+        return walletToUser[_walletAddress];
+    }
+
+    /// @notice Checks if a wallet exists for a given user
+    /// @param _user The user address to check
+    /// @return True if a wallet exists for the user, false otherwise
+    function hasWallet(address _user) public view returns (bool) {
+        return userWallets[_user] != address(0);
+    }
+
+    /// @notice Gets the total number of wallets created
+    /// @return The total number of wallets
+    function getTotalWallets() public view returns (uint256) {
+        return totalWallets;
+    }
+}
+
+
+========================================
+
+
+File: ./src/interfaces/IWalletFactory.sol
+----------------------------------------
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+interface IWalletFactory {
+    error WalletFactory__WalletAlreadyExists();
+
+    event WalletCreated(address indexed user, address wallet);
+
+    function createWallet() external returns (address);
+
+    function getUserWallet(address user) external view returns (address);
+
+    function getEntryPointAddress() external view returns (address);
+
+    function isValidUserWallet(address _address) external view returns (bool);
+
+    function getUserFromWallet(address _walletAddress) external view returns (address);
+
+    function hasWallet(address _user) external view returns (bool);
+
+    function getTotalWallets() external view returns (uint256);
+
+    function userWallets(address user) external view returns (address);
+
+    function walletToUser(address wallet) external view returns (address);
+
+    function totalWallets() external view returns (uint256);
+}
+
+========================================
+
+
+File: ./src/interfaces/IUserWallet.sol
+----------------------------------------
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import {IAccount} from "../../lib/account-abstraction/contracts/interfaces/IAccount.sol";
+import {PackedUserOperation} from "../../lib/account-abstraction/contracts/interfaces/PackedUserOperation.sol";
+
+interface IUserWallet is IAccount {
+    event Received(address sender, uint256 amount);
+    event Executed(address target, uint256 value, bytes data);
+
+    function validateUserOp(PackedUserOperation calldata userOp, bytes32 userOpHash, uint256 missingAccountFunds)
+        external
+        returns (uint256 validationData);
+
+    function execute(address destination, uint256 value, bytes calldata functionData) external;
+
+    function getBalance() external view returns (uint256);
+
+    function withdraw() external;
+
+    function isUserWallet() external pure returns (bool);
+
+    function getEntryPoint() external view returns (address);
+
+    // Inherited from Ownable, but included for completeness
+    function owner() external view returns (address);
+    function transferOwnership(address newOwner) external;
+    function renounceOwnership() external;
+}
+
+
+========================================
+
+
